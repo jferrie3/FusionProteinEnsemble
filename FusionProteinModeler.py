@@ -318,16 +318,21 @@ def MultiFuser(fasta_sequences, pdb_structures):
 		ft = FoldTree()
 		ft.simple_tree(Npose.total_residue())
 		Npose.fold_tree(ft)
-		pyrosetta.rosetta.protocols.idealize.basic_idealize(Npose, idealize_vector, SF2, 1)
+		pyrosetta.rosetta.protocols.idealize.basic_idealize(Npose, idealize_vector, SF2, 0)
 		FLpose.assign(Npose)
+	'''	
 	## After creating the Fusions Protein	
 	SF2 = create_score_function("ref2015_cart")
 	movemap_cart = MoveMap()
-	movemap_cart.set_bb(True)
-	movemap_cart.set_chi(True)
+	movemap_cart.set_bb(False)
+	movemap_cart.set_chi(False)
+	for linker in linker_segments:
+		for res_i in range(linker[0], linker[1] + 1):
+			movemap_cart.set_bb(res_i, True)
+			movemap_cart.set_chi(res_i, True)
 	movemap_cart.set(pyrosetta.rosetta.core.id.DOF_Type.THETA, True)
 	minmover_cart = pyrosetta.rosetta.protocols.minimization_packing.MinMover()
-	minmover_cart.movemap(movemap)
+	minmover_cart.movemap(movemap_cart)
 	minmover_cart.score_function(SF2)
 	minmover_cart.min_type('lbfgs_armijo_nonmonotone') #Call particular minimization type (dfpmin_armijo_nonmonotone) originally linmin
 	minmover_cart.tolerance(0.0001)
@@ -335,6 +340,7 @@ def MultiFuser(fasta_sequences, pdb_structures):
 	minmover_cart.omega(True)
 	minmover_cart.apply(FLpose)
 	pmm.apply(FLpose)
+	'''
 	### Dump the fusion protein ###
 	FLseq = FLpose.sequence()
 	with open(args.Output_Name + '.fasta', 'a') as FLfasta:

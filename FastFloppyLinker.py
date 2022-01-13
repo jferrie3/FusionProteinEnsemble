@@ -41,12 +41,14 @@ parser.add_argument('-inpdb', '--Input_PDB_File', action='store', type=str, requ
 	help='Name of the text file containing the PDB structure of the protein of interest. All residues are required, missing residues are not constructed')
 parser.add_argument('-pymol', '--PYMOL', action='store_true', required=False,
 	help='Running with this flag will utilize PyMOL Mover for visualization')
-parser.add_argument('-rg', '--RG', action='store', type=float, required=False,
+parser.add_argument('-rg', '--RG', action='store_true', required=False,
 	help='Ability to provide radius of gyration via Ferrie et. al. JPCB 2020 rg score term')
 parser.add_argument('-clusterid', '--Cluster_ID', action='store', type=int, required=False,
 	help='Batch submit script ID for output record keeping')
 parser.add_argument('-verbose', '--Verbose', action='store_true', required=False,
 	help='Will unmute information coming from Rosetta')
+parser.add_argument('-dumpall', '--DumpAll', action='store_true', required=False,
+	help='Dumps both the pre-relaxed and relaxed structures')
 args = parser.parse_args()
 
 # The Start-Up
@@ -126,7 +128,7 @@ if args.Disorder_Probability_Prediction_File:
 	diso_dat = np.empty((len(disorder_dat),1))
 	diso_segments = []
 	diso_cutoff = 0.5
-	seg_cutoff = 10
+	seg_cutoff = 2
 	seg_res_counter = 0
 	per_residue_disorder = 0
 	diso_current = disorder_dat[0][3]
@@ -141,7 +143,7 @@ if args.Disorder_Probability_Prediction_File:
 			seg_res_counter = seg_res_counter + 1
 		elif disorder_dat[seg_residue][3] >= diso_cutoff and diso_current < diso_cutoff:
 			seg_res_counter = seg_res_counter + 1
-		if seg_res_counter > 9:
+		if seg_res_counter > 1:
 			seg_res_counter = 0
 			diso_current = disorder_dat[seg_residue][3]
 			if diso_current >= diso_cutoff:
@@ -245,6 +247,7 @@ if args.Linker_File:
 	fullmap.set_chi(False)
 	linker_file = open(args.Linker_File, 'r')
 	linker_lines = linker_file.readlines()
+	linker_residues = []
 	for linker_line in linker_lines:
 		start_res = int(linker_line.split(' ')[0])
 		end_res = int(linker_line.split(' ')[1])
@@ -257,6 +260,7 @@ if args.Linker_File:
 				fullmap.set_bb(residue, True)
 				fullmap.set_chi(residue, True)
 				sampled_residues.append(residue)
+				linker_residues.append(residue)
 
 # Only sample residues within the loops
 loop_residues = []
@@ -305,20 +309,131 @@ pcen = Pose()
 # The Score Functions
 # Adding an RG Constraint
 if args.RG:
+	#### Computing the Mean Hydrophobicity per Residue
+	scaling_info_holder = np.zeros([len(segment_break_list),5]) # Need spots for segH,segQ,frac_pos,frac_neg,seq_len -> scalvQ,scalvH,scalv,rad_gyr,seq_len => scalvQ -> sf_rg_term_potential
+	
+	##### Kyte, J. Doolitte, R.F. J. Mol. Biol. (1982) 157, 105-132
+	##### Normalization proposed in Uversky, V.N. et. al. Proteins: Struc. Func. Gen. (2000), 41, 415-427
+	aa_hydro_idx = {'I':4.5, 'V':4.2, 'L':3.8, 'F':2.8, 'C':2.5, 'M':1.9, 'A':1.8, 'G':-0.4, 'T':-0.7, 'W':-0.9, 'S':-0.8, 'Y':-1.3, 'P':-1.6, 'H':-3.2, 'E':-3.5, 'Q':-3.5, 'D':-3.5, 'N':-3.5, 'K':-3.9, 'R':-4.5}
+	for diso_segment_idx, diso_segment_item in enumerate(segment_break_list):
+		start_res = 1
+		if diso_segment_idx > 0:
+			start_res = segment_break_list[diso_segment_idx-1][0] + 1
+		end_res = diso_segment_item[0] + 1
+		seq_len = end_res-start_res
+		pro_len = p.total_residue()
+		scaling_info_holder[diso_segment_idx][4] = seq_len
+		sequence_avg_H = 0
+		for res_idx in range(start_res-1, end_res-1, 1):
+			window_start = 0
+			window_end = 0
+			window_H_avg = 0
+			if res_idx < 5:
+				window_start = 0
+				window_end = res_idx + 1
+			elif pro_len - res_idx < 5:
+				window_start = res_idx
+				window_end = pro_len
+			else:
+				window_start = res_idx - 2
+				window_end = res_idx + 3
+			window = p.sequence()[window_start:window_end]
+			for window_res_idx, window_res_item in enumerate(window):
+				window_H_avg = window_H_avg + ((aa_hydro_idx[str(window_res_item)]+4.5)/9.0)
+			window_H_avg = window_H_avg/(len(window))
+			sequence_avg_H = sequence_avg_H + window_H_avg/scaling_info_holder[diso_segment_idx][4]
+			scaling_info_holder[diso_segment_idx][0] = sequence_avg_H
+	
+	#### Computing the Mean Net Charge per Residue
+	for diso_segment_idx, diso_segment_item in enumerate(segment_break_list):
+		start_res = 1
+		if diso_segment_idx > 0:
+			start_res = segment_break_list[diso_segment_idx-1][0] + 1
+		end_res = diso_segment_item[0] + 1
+		seq_len = end_res-start_res
+		scaling_info_holder[diso_segment_idx][4] = seq_len
+		sequence_Q = 0
+		frac_pos = 0 # fraction of positively charged residues Arg Lys
+		frac_neg = 0 # fraction of negatively charged residues Asp Glu
+		for res_idx in range(start_res-1, end_res-1, 1):
+			res_id = p.sequence()[res_idx]
+			if res_id == 'E' or res_id == 'D':
+				frac_neg = frac_neg + 1/seq_len
+				sequence_Q = sequence_Q - 1/seq_len
+			elif res_id == 'K' or res_id == 'R':
+				frac_pos = frac_pos + 1/seq_len
+				sequence_Q = sequence_Q + 1/seq_len
+			else:
+				continue
+		sequence_Q = np.sqrt(sequence_Q**2)
+		scaling_info_holder[diso_segment_idx][1] = sequence_Q
+		scaling_info_holder[diso_segment_idx][2] = frac_pos
+		scaling_info_holder[diso_segment_idx][3] = frac_neg
+	
+	#### Calculations from Hofmann, H. et al. PNAS (2012) 109, 40, 16155-16160
+	##### Compute charge and hydrophobicity scaling options
+	###### Constants
+	scalv = 0
+	con_a = 0.394
+	con_z = 0.09
+	con_x0 = 0.114
+	con_c = 1.72
+	con_d = 0.9
+	
+	###### Calculations
+	###### Folded vs Unfolded
+	###### From Uversky, if sequence_Q < 2.785*sequence_avg_H - 1.151 -> Folded, but fails for synuclein
+	for QH_set_idx in range(len(scaling_info_holder)):
+		if 'order' in segment_break_list[QH_set_idx]:
+			scaling_info_holder[QH_set_idx][0] = 0.33
+			scaling_info_holder[QH_set_idx][1] = 0.33
+		else:
+			scalv_Q = (1.0/3.0) + con_a*((1+np.exp(con_x0-scaling_info_holder[QH_set_idx][1]/con_z))**(-1))
+			scaling_info_holder[QH_set_idx][1] = scalv_Q
+			scalv_H = (1.0/3.0) + con_a*((1+np.exp((con_x0+con_c*scaling_info_holder[QH_set_idx][0]-con_d)/con_z))**(-1))
+			scaling_info_holder[QH_set_idx][0] = scalv_H
+	
+	###### Determining the appropriate scaling value
+	####### Constants
+	elemchar = 1.602*10**(-19)
+	ss_eo = 8.854*10**(-12)
+	ss_er = 78.7 #permittivity of water at 298 K
+	ss_kb = 1.38*10**(-23) # boltzmann constant
+	ss_T = 298 # in Kelvin
+	ss_I = 0.15 # in Molar
+	ss_kappa = 1/(0.304*np.sqrt(ss_I)) # in nanometers
+	ss_lB = (elemchar**2)/(4*np.pi*ss_eo*ss_er*ss_kb*ss_T)
+	
+	####### Calculation
+	for QH_set_idx in range(len(scaling_info_holder)):
+		scalvstar = ((4*np.pi*ss_lB*((scaling_info_holder[QH_set_idx][2]-scaling_info_holder[QH_set_idx][3])**2))/(ss_kappa**2)) - ((np.pi*ss_lB*((scaling_info_holder[QH_set_idx][2]+scaling_info_holder[QH_set_idx][3])**2))/(ss_kappa))
+		if scaling_info_holder[QH_set_idx][2] == 0:
+			if scaling_info_holder[QH_set_idx][3] == 0:
+				scalv = scaling_info_holder[QH_set_idx][0]
+			else:
+				scalv = scaling_info_holder[QH_set_idx][1]
+		elif scaling_info_holder[QH_set_idx][3] == 0:
+			if scaling_info_holder[QH_set_idx][2] == 0:
+				scalv = scaling_info_holder[QH_set_idx][0]
+			else:
+				scalv = scaling_info_holder[QH_set_idx][1]
+		elif scalvstar < 0:
+			scalv = scaling_info_holder[QH_set_idx][1]
+		else:
+			scalv = scaling_info_holder[QH_set_idx][0]
+		scaling_info_holder[QH_set_idx][2] = scalv
+	
 	##### Computing the Expected Radius of Gyration
 	rg_b = 0.38 # in nanometers
 	rg_lp = 0.53 # in nanometers
+	for QH_set_idx in range(len(scaling_info_holder)):
+		rad_gyr = (np.sqrt((2*rg_lp*rg_b)/((2*scaling_info_holder[QH_set_idx][2]+1)*(2*scaling_info_holder[QH_set_idx][2]+2)))*(scaling_info_holder[QH_set_idx][4]**scaling_info_holder[QH_set_idx][2]))*10 # in Angstroms
+		scaling_info_holder[QH_set_idx][3] = rad_gyr
+	
+	## Making the Actual Potential Energy Function
+	## Constants for Probability
 	gamma = 1.1615
-	seq_N = len(p.sequence())
-	# Solving for scaling from Rg
-	def v_from_pr(var_a):
-		return ((np.sqrt((2*rg_lp*rg_b)/((2*var_a+1)*(2*var_a+2)))*(seq_N**var_a))*10)-args.RG # in Angstroms
-	seq_v0 = 1.0
-	seq_v1 = op.fsolve(v_from_pr, seq_v0)
-	var_g = (gamma-1)/seq_v1
-	var_delta = 1/(1-seq_v1)
-	r_set=np.arange(0.0,7*args.RG,0.01)
-	saw_inputs = (r_set, args.RG, var_g, var_delta)
+	
 	## Concocting the Potential
 	def pr_saw(var_a, input_vars):
 		r, rg, g, delta = input_vars
@@ -327,9 +442,17 @@ if args.RG:
 	def solve_pr_saw(var_a, *input_vars):
 		r, rg, g, delta = input_vars
 		return (np.sum((var_a[0]*4*np.pi/rg)*((r/rg)**(2+g))*np.exp(-var_a[1]*((r/rg)**delta)))-1, np.sum((var_a[0]*4*np.pi/rg)*((r/rg)**(2+g))*np.exp(-var_a[1]*((r/rg)**delta))*(r**2))-rg**2)
-	a0 = [1.0, 1.0]
-	a1 = op.fsolve(solve_pr_saw,a0,args=saw_inputs)
-	rg_sf_term_potential = interp1d(r_set, (1-(pr_saw(a1, saw_inputs)/np.max(pr_saw(a1, saw_inputs)))))
+	
+	rg_sf_term_potential_list = []
+	for QH_set_idx in range(len(scaling_info_holder)):
+		var_g = (gamma-1)/scaling_info_holder[QH_set_idx][2]
+		var_delta = 1/(1-scaling_info_holder[QH_set_idx][2])
+		r_set=np.arange(0.0,7*scaling_info_holder[QH_set_idx][3],0.01)
+		saw_inputs = (r_set, scaling_info_holder[QH_set_idx][3], var_g, var_delta)
+		a0 = [1.0, 1.0]
+		a1 = op.fsolve(solve_pr_saw,a0,args=saw_inputs)
+		rg_sf_term_potential = interp1d(r_set, (1-(pr_saw(a1, saw_inputs)/np.max(pr_saw(a1, saw_inputs)))))
+		rg_sf_term_potential_list.append(rg_sf_term_potential)
 	
 	## Making the Actual Score Term
 	from pyrosetta.rosetta.core.scoring.methods import ContextIndependentOneBodyEnergy ## newer versions make this pyrosetta.rosetta
@@ -347,25 +470,33 @@ if args.RG:
 			"""Calculate energy of res of pose and emap"""
 			pose = pose ## for newer versions remove line
 			e_val = 0
-			r_xyz = np.zeros([seq_N, 3])
-			rg_sq = np.zeros([seq_N, 1])
-			start_res = 1
-			end_res = seq_N
-			
-			for res_num in range(start_res, end_res, 1):
-				for res_xyz in range(len(r_xyz[0])):
-					r_xyz[res_num-start_res][res_xyz] = pose.residue(res_num).nbr_atom_xyz()[res_xyz]
-			r_cen_mass = np.average(r_xyz, axis=0)
-			for res_num in range(len(r_xyz)):
-				rg_sq[res_num] = (np.linalg.norm(r_xyz[res_num] - r_cen_mass))**2
-			rg_val = np.sqrt(np.average(rg_sq))
-			if rg_val < 7*args.RG:
-				e_val = e_val + float(rg_sf_term_potential(rg_val))
-			else:
-				e_val = e_val + float(rg_sf_term_potential(6.9*args.RG))	
+			for segment_idx in range(len(segment_break_list)):
+				if segment_break_list[segment_idx][1] == 'order':
+					continue
+				else:
+					r_xyz = np.zeros([int(scaling_info_holder[segment_idx][4]), 3])
+					rg_sq = np.zeros([int(scaling_info_holder[segment_idx][4]), 1])
+					start_res = 1
+					if segment_idx > 0:
+						start_res = segment_break_list[segment_idx-1][0] + 1
+					end_res = segment_break_list[segment_idx][0] + 1
+					for res_num in range(start_res, end_res, 1):
+						for res_xyz in range(len(r_xyz[0])):
+							r_xyz[res_num-start_res][res_xyz] = pose.residue(res_num).nbr_atom_xyz()[res_xyz]
+					r_cen_mass = np.average(r_xyz, axis=0)
+					for res_num in range(len(r_xyz)):
+						rg_sq[res_num] = (np.linalg.norm(r_xyz[res_num] - r_cen_mass))**2
+					rg_val = np.sqrt(np.average(rg_sq))
+					if rg_val < 7*scaling_info_holder[segment_idx][3]:
+						rg_sf_term_potential = rg_sf_term_potential_list[segment_idx]
+						e_val = e_val + float(rg_sf_term_potential(rg_val))
+					else:
+						rg_sf_term_potential = rg_sf_term_potential_list[segment_idx]
+						e_val = e_val + float(rg_sf_term_potential(6.9*scaling_info_holder[segment_idx][3]))	
 			emap.set(self.scoreType, e_val) ## for newer versions remove .get()
 	
 	new_rg_score = SeqCorrRgMethod.scoreType
+
 	
 ## VDW Repulsive Score Function
 sf_stage_0 = create_score_function('score0')
@@ -778,12 +909,15 @@ if args.PYMOL:
 for i in range(ftnstruct):
 	p = Pose()
 	p.assign(starting_p)
+	for resi in linker_residues:
+		p.set_phi(resi, 180)
+		p.set_psi(resi, 180)
 	if args.PYMOL:
 		pmm.apply(p)
+	mc_stage_0.reset(p)	
 	stage_0.apply(p)
 	if args.PYMOL:
 		pmm.apply(p)
-	mc_stage_0.reset(p)
 	mc_stage_1.reset(p)
 	stage_1_last_j_score = 0
 	stage_1_last_j = 0
@@ -798,8 +932,7 @@ for i in range(ftnstruct):
 			pmm.apply(p)
 		if j % 50 == 0:
 			sf_stage_1.show(p)
-			if args.RG:
-				print(' Target Rg: ' + str(args.RG) + ' Current Rg: ' + str(sfrg(p)))
+			print('Current Rg: ' + str(sfrg(p)))
 		## Move on to the next sampling step if sampling has converged
 		if j == 0:
 			stage_1_last_j_score = sf_stage_1.score(p)
@@ -843,8 +976,7 @@ for i in range(ftnstruct):
 			pmm.apply(p)
 		if k % 25 == 0:
 			sf_stage_2.show(p)
-			if args.RG:
-				print(' Target Rg: ' + str(args.RG) + ' Current Rg: ' + str(sfrg(p)))
+			print('Current Rg: ' + str(sfrg(p)))
 		## Move on to the next sampling step if sampling has converged
 		if k == 0:
 			stage_1_last_k_score = sf_stage_2.score(p)
@@ -858,17 +990,30 @@ for i in range(ftnstruct):
 	mc_stage_2.recover_low(p)
 	if args.PYMOL:
 		pmm.apply(p)
+	if args.DumpAll:	
+		if args.Cluster_ID:
+			pdb_out = "FastFloppyLinker_out_" + str(args.Cluster_ID) + ".pdb"
+			outf = open("FastFloppyLinker.sc", 'a')
+			fcntl.flock (outf.fileno(), fcntl.LOCK_EX)
+			outf.seek(0, 2)
+			outf.write("%s\t%.3f\t%.3f\n" % (pdb_out, sf_stage_2(p), round(inter_fluor_distance(p), 2)))
+			outf.close()
+		else:	
+			outf = open("FloppyTail.sc", 'a')
+			pdb_out = "FloppyTail_out_%i.pdb" %i
+			outf.write("%s\t%.3f\t%.3f\n" % (pdb_out, sf_stage_2(p), round(inter_fluor_distance(p), 2)))
+		p.dump_pdb(pdb_out)	
 	relax.apply(p) # THIS IS NEW AND NOT IN THE ORIGINAL FASTFLOPPYTAIL
 	if args.Cluster_ID:
-		pdb_out = "FastFloppyLinker_out_" + str(args.Cluster_ID) + ".pdb"
-		outf = open("FastFloppyLinker.sc", 'a')
+		pdb_out = "FastFloppyLinker_Relaxed_out_" + str(args.Cluster_ID) + ".pdb"
+		outf = open("FastFloppyLinker_Relaxed.sc", 'a')
 		fcntl.flock (outf.fileno(), fcntl.LOCK_EX)
 		outf.seek(0, 2)
 		outf.write("%s\t%.3f\t%.3f\n" % (pdb_out, sf_stage_2(p), round(inter_fluor_distance(p), 2)))
 		outf.close()
 	else:	
-		outf = open("FloppyTail.sc", 'a')
-		pdb_out = "FloppyTail_out_%i.pdb" %i
+		outf = open("FloppyTail_Relaxed.sc", 'a')
+		pdb_out = "FloppyTail_Relaxed_out_%i.pdb" %i
 		outf.write("%s\t%.3f\t%.3f\n" % (pdb_out, sf_stage_2(p), round(inter_fluor_distance(p), 2)))
 	p.dump_pdb(pdb_out)
 	outf.close()

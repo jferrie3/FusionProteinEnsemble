@@ -1,6 +1,6 @@
 #!/bin/bash
 # Job name:
-#SBATCH --job-name=Halo7xIgSnap
+#SBATCH --job-name=Halo1xIgSnap
 #
 # Account:
 #SBATCH --account=fc_3dgenome

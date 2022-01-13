@@ -1,6 +1,6 @@
 #!/bin/bash
 # Job name:
-#SBATCH --job-name=Halo5xIgSnap
+#SBATCH --job-name=Halo1xIgSnap
 #
 # Account:
 #SBATCH --account=fc_3dgenome
@@ -15,7 +15,7 @@
 #SBATCH --cpus-per-task=1
 #
 # Wall clock limit:
-#SBATCH --time=07:00:00
+#SBATCH --time=05:00:00
 #
 ## Command(s) to run:
 module load gnu-parallel/2019.03.22
